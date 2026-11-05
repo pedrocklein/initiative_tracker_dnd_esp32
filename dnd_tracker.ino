@@ -178,7 +178,6 @@ void updateDisplay() {
   int w = tft.width();
   int h = tft.height();
 
-  // Tela de Modo Configuração (Fallback de Wi-Fi)
   if (isApMode) {
     tft.setTextColor(TFT_ORANGE, TFT_BLACK);
     tft.drawCentreString("CONFIGURACAO", w / 2, 12, 4);
@@ -199,7 +198,6 @@ void updateDisplay() {
     return;
   }
 
-  // Tela Normal Fora de Combate
   if (!inCombat) {
     tft.setTextColor(TFT_GOLD, TFT_BLACK);
     tft.drawCentreString("D&D TRACKER", w / 2, 16, 4);
@@ -221,7 +219,6 @@ void updateDisplay() {
     return;
   }
 
-  // Tela em Combate
   Combatant current = combatants[currentIndex];
 
   tft.fillRect(0, 0, w, 24, TFT_NAVY);
@@ -280,7 +277,7 @@ const char INDEX_HTML[] = R"=====(
     .btn-prev { background: #e65100; color: white; font-size: 1.1rem; margin-bottom: 6px; }
     .btn-next { background: #1565c0; color: white; font-size: 1.1rem; margin-bottom: 6px; }
     .btn-end { background: #424242; color: white; margin-top: 4px; }
-    .btn-sec { background: #37474f; color: #eee; font-size: 0.9rem; margin: 4px 0; }
+    .btn-sec { background: #37474f; color: #eee; font-size: 0.95rem; margin: 6px 0; display: block; text-align: center; border-radius: 6px; text-decoration: none; padding: 12px; box-sizing: border-box; font-weight: bold; cursor: pointer; }
     .combatant-item { display: flex; justify-content: space-between; align-items: center; padding: 8px 10px; border-bottom: 1px solid #2d2d2d; }
     .item-actions button { width: auto; padding: 4px 8px; margin: 0 2px; font-size: 0.85rem; background: #333; color: #fff; border: 1px solid #555; }
     .status-badge { font-weight: bold; color: #d4af37; text-align: center; font-size: 1.1rem; margin-bottom: 10px; }
@@ -330,12 +327,18 @@ const char INDEX_HTML[] = R"=====(
     <button style="background: transparent; color: #777; border: 1px solid #444; margin-top: 10px;" onclick="action('/clear')">Limpar Todos</button>
   </div>
 
-  <!-- GERENCIAR JSON (EXPORTAR / IMPORTAR) -->
+  <!-- GERENCIAR JSON (EXPORTAR / IMPORTAR / COLAR) -->
   <div class="card">
     <h3 style="margin: 0 0 8px 0;">📂 Salvar & Carregar (JSON)</h3>
     <button class="btn-sec" onclick="exportJson()">💾 Baixar Lista Atual (Exportar JSON)</button>
-    <button class="btn-sec" onclick="document.getElementById('jsonFileInput').click()">📥 Carregar Arquivo JSON (Importar)</button>
-    <input type="file" id="jsonFileInput" accept=".json" style="display:none;" onchange="importJson(this)">
+    
+    <!-- Input com Label nativo compatível com Android -->
+    <label class="btn-sec" style="background: #2e7d32;">
+      📥 Carregar Arquivo JSON (Do Celular)
+      <input type="file" id="jsonFileInput" accept="*/*" style="display:none;" onchange="importJson(this)">
+    </label>
+
+    <button class="btn-sec" style="background: #455a64;" onclick="pasteJson()">📋 Colar Texto JSON (Alternativa)</button>
   </div>
 
   <!-- CONFIGURAÇÃO DE WI-FI -->
@@ -427,6 +430,7 @@ const char INDEX_HTML[] = R"=====(
       fetch(`/edit?idx=${idx}&name=${encodeURIComponent(name)}&icon=${currentIcon}&init=${init}`).then(() => loadStatus());
     }
 
+    // Exportar JSON (Baixar)
     function exportJson() {
       let dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(currentList, null, 2));
       let a = document.createElement('a');
@@ -435,6 +439,27 @@ const char INDEX_HTML[] = R"=====(
       a.click();
     }
 
+    // Processamento Seguro e Sequencial do JSON
+    async function processImportedList(list) {
+      if (!Array.isArray(list) || list.length === 0) {
+        return alert('JSON inválido ou vazio! Deve ser uma lista de combatentes.');
+      }
+      try {
+        await fetch('/clear');
+        for (let c of list) {
+          let name = encodeURIComponent(c.name || 'Heroi');
+          let icon = c.icon || 'warrior';
+          let init = c.initiative || 10;
+          await fetch(`/add?name=${name}&icon=${icon}&init=${init}`);
+        }
+        loadStatus();
+        alert('Personagens importados com sucesso!');
+      } catch (err) {
+        alert('Erro ao enviar para o ESP32: ' + err.message);
+      }
+    }
+
+    // Importar via Arquivo (compatível com Android)
     function importJson(input) {
       let file = input.files[0];
       if (!file) return;
@@ -442,23 +467,25 @@ const char INDEX_HTML[] = R"=====(
       reader.onload = function(e) {
         try {
           let list = JSON.parse(e.target.result);
-          if (!Array.isArray(list)) return alert('JSON inválido: deve conter uma lista.');
-          
-          fetch('/clear').then(() => {
-            let promises = list.map(c => 
-              fetch(`/add?name=${encodeURIComponent(c.name)}&icon=${c.icon || 'warrior'}&init=${c.initiative || 10}`)
-            );
-            Promise.all(promises).then(() => {
-              loadStatus();
-              alert('Personagens importados com sucesso!');
-            });
-          });
+          processImportedList(list);
         } catch(err) {
-          alert('Erro ao processar arquivo JSON: ' + err.message);
+          alert('Erro ao ler o arquivo JSON: ' + err.message);
         }
       };
       reader.readAsText(file);
       input.value = '';
+    }
+
+    // Importar colando o texto (alternativa à prova de falhas no celular)
+    function pasteJson() {
+      let text = prompt("Cole o conteúdo do seu JSON aqui:");
+      if (!text) return;
+      try {
+        let list = JSON.parse(text);
+        processImportedList(list);
+      } catch(err) {
+        alert("Texto JSON inválido: " + err.message);
+      }
     }
 
     function toggleWifiSection() {
@@ -713,16 +740,13 @@ void setup() {
   ts.begin(touchSpi);
   ts.setRotation(0);
 
-  // Carrega lista de combatentes salva na memória Flash
   loadCombatantsFromNVS();
 
-  // Lê credenciais de Wi-Fi salvas (ou usa o padrão do topo)
   prefs.begin("dnd_wifi", true);
   String currentSsid = prefs.getString("ssid", default_ssid);
   String currentPass = prefs.getString("pass", default_pass);
   prefs.end();
 
-  // Tela de Conexão
   tft.setTextColor(TFT_WHITE, TFT_BLACK);
   tft.drawCentreString("Conectando ao Wi-Fi...", tft.width() / 2, 70, 2);
   tft.setTextColor(TFT_YELLOW, TFT_BLACK);
@@ -736,7 +760,7 @@ void setup() {
   Serial.println("Tentando conectar em: " + currentSsid);
 
   int tentativas = 0;
-  while (WiFi.status() != WL_CONNECTED && tentativas < 24) { // ~12s de espera
+  while (WiFi.status() != WL_CONNECTED && tentativas < 24) {
     delay(500);
     Serial.print(".");
     tentativas++;
@@ -748,7 +772,6 @@ void setup() {
     Serial.print("IP: ");
     Serial.println(WiFi.localIP());
   } else {
-    // FALLBACK: Cria Ponto de Acesso Próprio
     isApMode = true;
     Serial.println("\nFalha ao conectar no roteador! Entrando em Modo AP...");
     WiFi.mode(WIFI_AP);
