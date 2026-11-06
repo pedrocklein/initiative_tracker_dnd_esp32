@@ -4,33 +4,46 @@
 #include <SPI.h>
 #include <XPT2046_Touchscreen.h>
 #include <Preferences.h>
+#include <FS.h>
+#include <SD.h>
 #include <vector>
 #include <algorithm>
 
-// --- Credenciais Padrão de Wi-Fi (usadas caso não haja nada salvo na Flash) ---
+// --- Credenciais Padrão de Wi-Fi ---
 const char* default_ssid = "Pedro";
 const char* default_pass = "internetico";
 
-// --- Configuração dos Pinos da Placa CYD ---
+// --- Mapeamento de Pinos da Placa CYD ---
 #define XPT2046_IRQ  36
 #define XPT2046_MOSI 32
 #define XPT2046_MISO 39
 #define XPT2046_CLK  25
 #define XPT2046_CS   33
+
+#define SD_CS        5
+#define SD_MOSI      23
+#define SD_MISO      19
+#define SD_SCK       18
+
 #define TFT_BL       21
 #define PIN_BTN_BOOT 0
 
 // Instâncias
 TFT_eSPI tft = TFT_eSPI();
-SPIClass touchSpi = SPIClass(HSPI);
+SPIClass touchSpi = SPIClass(HSPI); // Touch no barramento HSPI
+SPIClass sdSPI = SPIClass(VSPI);    // MicroSD no barramento VSPI
 XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
 WebServer server(80);
 Preferences prefs;
+
+bool sdAvailable = false;
+File uploadFile; // Manipulador para upload de imagens
 
 struct Combatant {
   String name;
   String icon;
   int initiative;
+  String image; // Nome do arquivo BMP no cartão SD (opcional)
 };
 
 std::vector<Combatant> combatants;
@@ -40,12 +53,89 @@ int currentRound = 1;
 unsigned long lastActionTime = 0;
 bool isApMode = false;
 
+// --- Leitor de Imagem BMP 24-bit do Cartão SD ---
+bool drawBmp(const char *filename, int x, int y) {
+  if (!sdAvailable || filename == NULL || strlen(filename) == 0) return false;
+
+  String path = filename;
+  if (!path.startsWith("/")) path = "/" + path;
+
+  File bmpFile = SD.open(path);
+  if (!bmpFile) {
+    path = "/images" + path; // Tenta também dentro da pasta /images/
+    bmpFile = SD.open(path);
+    if (!bmpFile) return false;
+  }
+
+  uint8_t header[54];
+  if (bmpFile.read(header, 54) != 54) {
+    bmpFile.close();
+    return false;
+  }
+
+  if (header[0] != 'B' || header[1] != 'M') {
+    bmpFile.close();
+    return false;
+  }
+
+  uint32_t imageOffset = *(uint32_t*)&header[10];
+  int32_t width        = *(int32_t*)&header[18];
+  int32_t height       = *(int32_t*)&header[22];
+  uint16_t depth       = *(uint16_t*)&header[28];
+  uint32_t compression= *(uint32_t*)&header[30];
+
+  // Apenas BMP 24-bit sem compressao
+  if (depth != 24 || compression != 0 || width <= 0) {
+    bmpFile.close();
+    return false;
+  }
+
+  bool flip = true;
+  if (height < 0) {
+    height = -height;
+    flip = false;
+  }
+
+  if (width > 240 || height > 240) {
+    bmpFile.close();
+    return false;
+  }
+
+  // Centraliza no eixo X se for passado -1
+  if (x == -1) {
+    x = (tft.width() - width) / 2;
+  }
+
+  bmpFile.seek(imageOffset);
+  int rowPadding = (4 - (width * 3) % 4) % 4;
+
+  uint16_t lineBuffer[width];
+  uint8_t bgr[3];
+
+  for (int row = 0; row < height; row++) {
+    int drawY = flip ? (y + height - 1 - row) : (y + row);
+    for (int col = 0; col < width; col++) {
+      if (bmpFile.read(bgr, 3) != 3) break;
+      lineBuffer[col] = tft.color565(bgr[2], bgr[1], bgr[0]);
+    }
+    if (rowPadding > 0) {
+      bmpFile.seek(bmpFile.position() + rowPadding);
+    }
+    if (drawY >= 0 && drawY < tft.height()) {
+      tft.pushImage(x, drawY, width, 1, lineBuffer);
+    }
+  }
+
+  bmpFile.close();
+  return true;
+}
+
 // --- Persistência de Dados (NVS / Flash) ---
 void saveCombatantsToNVS() {
   prefs.begin("dnd_data", false);
   String data = "";
   for (size_t i = 0; i < combatants.size(); i++) {
-    data += combatants[i].name + "|" + combatants[i].icon + "|" + String(combatants[i].initiative) + "\n";
+    data += combatants[i].name + "|" + combatants[i].icon + "|" + String(combatants[i].initiative) + "|" + combatants[i].image + "\n";
   }
   prefs.putString("list", data);
   prefs.end();
@@ -69,11 +159,18 @@ void loadCombatantsFromNVS() {
 
     int p1 = line.indexOf('|');
     int p2 = line.indexOf('|', p1 + 1);
+    int p3 = line.indexOf('|', p2 + 1);
     if (p1 != -1 && p2 != -1) {
       Combatant c;
       c.name = line.substring(0, p1);
       c.icon = line.substring(p1 + 1, p2);
-      c.initiative = line.substring(p2 + 1).toInt();
+      if (p3 != -1) {
+        c.initiative = line.substring(p2 + 1, p3).toInt();
+        c.image = line.substring(p3 + 1);
+      } else {
+        c.initiative = line.substring(p2 + 1).toInt();
+        c.image = "";
+      }
       combatants.push_back(c);
     }
   }
@@ -227,7 +324,17 @@ void updateDisplay() {
   tft.drawRightString(String(currentIndex + 1) + "/" + String(combatants.size()), w - 6, 4, 2);
 
   int iconY = 56;
-  drawClassIcon(w / 2, iconY, current.icon);
+  bool imgDrawn = false;
+
+  // Tenta desenhar a imagem BMP do SD se informada
+  if (current.image.length() > 0 && sdAvailable) {
+    imgDrawn = drawBmp(current.image.c_str(), -1, 32);
+  }
+
+  // Fallback: se nao houver imagem ou falhar a leitura, usa o icone padrao
+  if (!imgDrawn) {
+    drawClassIcon(w / 2, iconY, current.icon);
+  }
 
   tft.setTextColor(TFT_SILVER, TFT_BLACK);
   tft.drawCentreString("[" + getClassName(current.icon) + "]", w / 2, iconY + 28, 2);
@@ -295,6 +402,28 @@ const char INDEX_HTML[] = R"=====(
     </div>
   </div>
 
+  <!-- ENCONTROS NO CARTÃO SD -->
+  <div class="card">
+    <h3 style="margin: 0 0 8px 0;">🗺️ Encontros no Cartão SD</h3>
+    <div id="sdStatusText" style="color: #aaa; font-size: 0.85rem; margin-bottom: 6px;">Verificando cartão...</div>
+    <div style="display: flex; gap: 6px;">
+      <select id="encounterSelect" style="flex: 2; margin: 0;">
+        <option value="">Nenhum encontro no SD</option>
+      </select>
+      <button class="btn-sec" style="flex: 1; margin: 0; background: #1b5e20;" onclick="loadEncounterFromSD()">Carregar</button>
+    </div>
+    <button class="btn-sec" style="background: #0277bd; margin-top: 8px;" onclick="saveCurrentEncounterToSD()">💾 Salvar Lista Atual no Cartão SD</button>
+  </div>
+
+  <!-- UPLOAD DE IMAGEM PARA O CARTÃO SD -->
+  <div class="card">
+    <h3 style="margin: 0 0 8px 0;">🖼️ Enviar Imagem BMP para o SD</h3>
+    <div style="color: #aaa; font-size: 0.85rem; margin-bottom: 6px;">Selecione uma imagem <b>.BMP</b> (ex: 48x48 ou 64x64 px) para enviar ao cartão:</div>
+    <input type="file" id="imgUploadInput" accept=".bmp,image/bmp">
+    <button class="btn-sec" style="background: #6a1b9a;" onclick="uploadImageFile()">📤 Enviar Imagem para o Cartão SD</button>
+    <div id="uploadStatusText" style="color: #00e676; font-size: 0.85rem; text-align: center; margin-top: 4px;"></div>
+  </div>
+
   <!-- ADICIONAR COMBATENTE -->
   <div class="card">
     <h3 style="margin: 0 0 8px 0;">Adicionar Combatente</h3>
@@ -317,6 +446,8 @@ const char INDEX_HTML[] = R"=====(
       <option value="boss">👑 Boss</option>
     </select>
     <input type="number" id="init" placeholder="Iniciativa (ex: 18)">
+    <input type="text" id="img" list="sdImagesDatalist" placeholder="Arquivo BMP no SD (ex: conan.bmp)">
+    <datalist id="sdImagesDatalist"></datalist>
     <button class="btn-add" onclick="addCombatant()">Adicionar à Fila</button>
   </div>
 
@@ -331,13 +462,10 @@ const char INDEX_HTML[] = R"=====(
   <div class="card">
     <h3 style="margin: 0 0 8px 0;">📂 Salvar & Carregar (JSON)</h3>
     <button class="btn-sec" onclick="exportJson()">💾 Baixar Lista Atual (Exportar JSON)</button>
-    
-    <!-- Input com Label nativo compatível com Android -->
     <label class="btn-sec" style="background: #2e7d32;">
       📥 Carregar Arquivo JSON (Do Celular)
       <input type="file" id="jsonFileInput" accept="*/*" style="display:none;" onchange="importJson(this)">
     </label>
-
     <button class="btn-sec" style="background: #455a64;" onclick="pasteJson()">📋 Colar Texto JSON (Alternativa)</button>
   </div>
 
@@ -384,10 +512,11 @@ const char INDEX_HTML[] = R"=====(
           let listHtml = '';
           data.list.forEach((c, idx) => {
             let isCurrent = (data.inCombat && idx === data.currentIndex) ? 'style="color:#00e676; font-weight:bold; background:#223322;"' : '';
+            let imgBadge = c.image ? ' 🖼️' : '';
             listHtml += `<div class="combatant-item" ${isCurrent}>
-              <span>${labels[c.icon] || '👤'} ${c.name} (${c.initiative})</span>
+              <span>${labels[c.icon] || '👤'} ${c.name} (${c.initiative})${imgBadge}</span>
               <div class="item-actions">
-                <button onclick="editItem(${idx}, '${encodeURIComponent(c.name)}', ${c.initiative}, '${c.icon}')">✏️</button>
+                <button onclick="editItem(${idx}, '${encodeURIComponent(c.name)}', ${c.initiative}, '${c.icon}', '${encodeURIComponent(c.image || '')}')">✏️</button>
                 <button onclick="deleteItem(${idx})">❌</button>
               </div>
             </div>`;
@@ -395,6 +524,105 @@ const char INDEX_HTML[] = R"=====(
           document.getElementById('list').innerHTML = listHtml || '<p style="color:#666">Nenhum combatente cadastrado.</p>';
         })
         .catch(e => console.log('Aguardando servidor...'));
+    }
+
+    function checkSdEncounters() {
+      fetch('/list_encounters')
+        .then(r => r.json())
+        .then(files => {
+          let sel = document.getElementById('encounterSelect');
+          let status = document.getElementById('sdStatusText');
+          if (!files || files.length === 0) {
+            sel.innerHTML = '<option value="">Nenhum encontro no SD</option>';
+            status.innerText = "Cartão SD conectado (pasta /encounters vazia).";
+          } else {
+            status.innerText = `Encontrado(s) ${files.length} encontro(s) no cartão SD:`;
+            let options = '';
+            files.forEach(f => {
+              let displayName = f.replace('.json', '').replace(/_/g, ' ');
+              options += `<option value="${f}">${displayName}</option>`;
+            });
+            sel.innerHTML = options;
+          }
+        })
+        .catch(() => {
+          document.getElementById('sdStatusText').innerText = "Cartão SD não detectado.";
+        });
+    }
+
+    function checkSdImages() {
+      fetch('/list_images')
+        .then(r => r.json())
+        .then(images => {
+          let datalist = document.getElementById('sdImagesDatalist');
+          let options = '';
+          images.forEach(img => {
+            options += `<option value="${img}"></option>`;
+          });
+          datalist.innerHTML = options;
+        })
+        .catch(e => console.log(e));
+    }
+
+    function uploadImageFile() {
+      let input = document.getElementById('imgUploadInput');
+      let file = input.files[0];
+      if (!file) return alert('Selecione um arquivo de imagem BMP primeiro!');
+
+      let status = document.getElementById('uploadStatusText');
+      status.innerText = "Enviando " + file.name + " para o SD... aguarde...";
+
+      let formData = new FormData();
+      formData.append('data', file, file.name);
+
+      fetch('/upload_image', {
+        method: 'POST',
+        body: formData
+      })
+      .then(r => r.text())
+      .then(msg => {
+        alert(msg);
+        status.innerText = "Imagem salva com sucesso: " + file.name;
+        input.value = '';
+        checkSdImages();
+      })
+      .catch(err => {
+        alert('Erro ao enviar imagem: ' + err.message);
+        status.innerText = "Erro no envio.";
+      });
+    }
+
+    function loadEncounterFromSD() {
+      let file = document.getElementById('encounterSelect').value;
+      if (!file) return alert('Selecione um encontro da lista!');
+      if (confirm(`Carregar o encontro "${file}"? A lista atual será substituída.`)) {
+        fetch('/get_encounter?file=' + encodeURIComponent(file))
+          .then(r => r.json())
+          .then(list => {
+            processImportedList(list);
+          })
+          .catch(err => alert('Erro ao carregar do SD: ' + err.message));
+      }
+    }
+
+    function saveCurrentEncounterToSD() {
+      if (currentList.length === 0) return alert('A lista atual está vazia!');
+      let name = prompt("Nome do arquivo (ex: emboscada_goblins):");
+      if (!name) return;
+      name = name.trim().replace(/\s+/g, '_');
+      if (!name.endsWith('.json')) name += '.json';
+
+      fetch('/save_encounter?file=' + encodeURIComponent(name), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(currentList, null, 2)
+      })
+      .then(r => r.text())
+      .then(msg => {
+        alert(msg);
+        checkSdEncounters();
+      })
+      .catch(err => alert('Erro ao salvar no SD: ' + err.message));
     }
 
     function action(endpoint) {
@@ -405,12 +633,14 @@ const char INDEX_HTML[] = R"=====(
       let name = document.getElementById('name').value.trim();
       let icon = document.getElementById('icon').value;
       let init = document.getElementById('init').value;
+      let img  = document.getElementById('img').value.trim();
       if (!name || !init) return alert('Preencha o nome e a iniciativa!');
 
-      fetch(`/add?name=${encodeURIComponent(name)}&icon=${icon}&init=${init}`)
+      fetch(`/add?name=${encodeURIComponent(name)}&icon=${icon}&init=${init}&img=${encodeURIComponent(img)}`)
         .then(() => {
           document.getElementById('name').value = '';
           document.getElementById('init').value = '';
+          document.getElementById('img').value = '';
           loadStatus();
         });
     }
@@ -421,16 +651,19 @@ const char INDEX_HTML[] = R"=====(
       }
     }
 
-    function editItem(idx, encodedName, currentInit, currentIcon) {
+    function editItem(idx, encodedName, currentInit, currentIcon, encodedImg) {
       let currentName = decodeURIComponent(encodedName);
+      let currentImg = decodeURIComponent(encodedImg || '');
       let name = prompt("Nome:", currentName);
       if (name === null) return;
       let init = prompt("Iniciativa:", currentInit);
       if (init === null) return;
-      fetch(`/edit?idx=${idx}&name=${encodeURIComponent(name)}&icon=${currentIcon}&init=${init}`).then(() => loadStatus());
+      let img = prompt("Arquivo no SD (ex: conan.bmp):", currentImg);
+      if (img === null) img = currentImg;
+
+      fetch(`/edit?idx=${idx}&name=${encodeURIComponent(name)}&icon=${currentIcon}&init=${init}&img=${encodeURIComponent(img)}`).then(() => loadStatus());
     }
 
-    // Exportar JSON (Baixar)
     function exportJson() {
       let dataStr = "data:text/json;charset=utf-8," + encodeURIComponent(JSON.stringify(currentList, null, 2));
       let a = document.createElement('a');
@@ -439,7 +672,6 @@ const char INDEX_HTML[] = R"=====(
       a.click();
     }
 
-    // Processamento Seguro e Sequencial do JSON
     async function processImportedList(list) {
       if (!Array.isArray(list) || list.length === 0) {
         return alert('JSON inválido ou vazio! Deve ser uma lista de combatentes.');
@@ -450,16 +682,16 @@ const char INDEX_HTML[] = R"=====(
           let name = encodeURIComponent(c.name || 'Heroi');
           let icon = c.icon || 'warrior';
           let init = c.initiative || 10;
-          await fetch(`/add?name=${name}&icon=${icon}&init=${init}`);
+          let img  = encodeURIComponent(c.image || '');
+          await fetch(`/add?name=${name}&icon=${icon}&init=${init}&img=${img}`);
         }
         loadStatus();
-        alert('Personagens importados com sucesso!');
+        alert('Personagens carregados com sucesso!');
       } catch (err) {
         alert('Erro ao enviar para o ESP32: ' + err.message);
       }
     }
 
-    // Importar via Arquivo (compatível com Android)
     function importJson(input) {
       let file = input.files[0];
       if (!file) return;
@@ -476,7 +708,6 @@ const char INDEX_HTML[] = R"=====(
       input.value = '';
     }
 
-    // Importar colando o texto (alternativa à prova de falhas no celular)
     function pasteJson() {
       let text = prompt("Cole o conteúdo do seu JSON aqui:");
       if (!text) return;
@@ -505,6 +736,8 @@ const char INDEX_HTML[] = R"=====(
 
     setInterval(loadStatus, 3000);
     loadStatus();
+    checkSdEncounters();
+    checkSdImages();
   </script>
 </body>
 </html>
@@ -515,6 +748,33 @@ void sendCorsHeaders() {
   server.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
   server.sendHeader("Access-Control-Allow-Headers", "*");
   server.sendHeader("Access-Control-Allow-Private-Network", "true");
+}
+
+// --- Callback de Upload de Arquivo para o MicroSD ---
+void handleFileUpload() {
+  if (!sdAvailable) return;
+  HTTPUpload& upload = server.upload();
+
+  if (upload.status == UPLOAD_FILE_START) {
+    String filename = upload.filename;
+    int slash = filename.lastIndexOf('/');
+    if (slash != -1) filename = filename.substring(slash + 1);
+    int backslash = filename.lastIndexOf('\\');
+    if (backslash != -1) filename = filename.substring(backslash + 1);
+
+    String path = "/images/" + filename;
+    Serial.printf("[SD UPLOAD] Iniciando gravacao: %s\n", path.c_str());
+    uploadFile = SD.open(path, FILE_WRITE);
+  } else if (upload.status == UPLOAD_FILE_WRITE) {
+    if (uploadFile) {
+      uploadFile.write(upload.buf, upload.currentSize);
+    }
+  } else if (upload.status == UPLOAD_FILE_END) {
+    if (uploadFile) {
+      uploadFile.close();
+      Serial.printf("[SD UPLOAD] Sucesso: %u bytes gravados\n", upload.totalSize);
+    }
+  }
 }
 
 // --- Rotas do Web Server ---
@@ -548,6 +808,7 @@ void handleAdd() {
     c.name = server.arg("name");
     c.icon = server.arg("icon");
     c.initiative = server.arg("init").toInt();
+    c.image = server.hasArg("img") ? server.arg("img") : "";
     combatants.push_back(c);
     saveCombatantsToNVS();
   }
@@ -576,6 +837,9 @@ void handleEdit() {
       combatants[idx].name = server.arg("name");
       combatants[idx].icon = server.arg("icon");
       combatants[idx].initiative = server.arg("init").toInt();
+      if (server.hasArg("img")) {
+        combatants[idx].image = server.arg("img");
+      }
       saveCombatantsToNVS();
       updateDisplay();
     }
@@ -669,7 +933,8 @@ void handleStatus() {
   for (size_t i = 0; i < combatants.size(); i++) {
     json += "{\"name\":\"" + combatants[i].name + "\",";
     json += "\"icon\":\"" + combatants[i].icon + "\",";
-    json += "\"initiative\":" + String(combatants[i].initiative) + "}";
+    json += "\"initiative\":" + String(combatants[i].initiative) + ",";
+    json += "\"image\":\"" + combatants[i].image + "\"}";
     if (i < combatants.size() - 1) json += ",";
   }
   json += "]}";
@@ -695,6 +960,109 @@ void handleSetWifi() {
     sendCorsHeaders();
     server.send(400, "text/plain", "SSID obrigatorio");
   }
+}
+
+// --- Rotas de Encontros e Imagens no Cartão MicroSD ---
+void handleListEncounters() {
+  String json = "[";
+  if (sdAvailable) {
+    File dir = SD.open("/encounters");
+    if (!dir) dir = SD.open("/");
+    if (dir && dir.isDirectory()) {
+      File file = dir.openNextFile();
+      bool first = true;
+      while (file) {
+        String fname = file.name();
+        if (!file.isDirectory() && fname.endsWith(".json")) {
+          int slash = fname.lastIndexOf('/');
+          if (slash != -1) fname = fname.substring(slash + 1);
+          if (!first) json += ",";
+          json += "\"" + fname + "\"";
+          first = false;
+        }
+        file = dir.openNextFile();
+      }
+    }
+  }
+  json += "]";
+  sendCorsHeaders();
+  server.send(200, "application/json", json);
+}
+
+void handleListImages() {
+  String json = "[";
+  if (sdAvailable) {
+    File dir = SD.open("/images");
+    if (!dir) dir = SD.open("/");
+    if (dir && dir.isDirectory()) {
+      File file = dir.openNextFile();
+      bool first = true;
+      while (file) {
+        String fname = file.name();
+        if (!file.isDirectory() && (fname.endsWith(".bmp") || fname.endsWith(".BMP"))) {
+          int slash = fname.lastIndexOf('/');
+          if (slash != -1) fname = fname.substring(slash + 1);
+          if (!first) json += ",";
+          json += "\"" + fname + "\"";
+          first = false;
+        }
+        file = dir.openNextFile();
+      }
+    }
+  }
+  json += "]";
+  sendCorsHeaders();
+  server.send(200, "application/json", json);
+}
+
+void handleGetEncounter() {
+  if (!sdAvailable || !server.hasArg("file")) {
+    sendCorsHeaders();
+    server.send(400, "text/plain", "Parametro invalido");
+    return;
+  }
+  String filename = server.arg("file");
+  String path = "/encounters/" + filename;
+  if (!SD.exists(path)) path = "/" + filename;
+
+  if (!SD.exists(path)) {
+    sendCorsHeaders();
+    server.send(404, "text/plain", "Arquivo nao encontrado no SD");
+    return;
+  }
+
+  File f = SD.open(path, FILE_READ);
+  sendCorsHeaders();
+  server.streamFile(f, "application/json");
+  f.close();
+}
+
+void handleSaveEncounter() {
+  if (!sdAvailable) {
+    sendCorsHeaders();
+    server.send(400, "text/plain", "Cartao SD nao disponivel");
+    return;
+  }
+  if (!server.hasArg("file") || !server.hasArg("plain")) {
+    sendCorsHeaders();
+    server.send(400, "text/plain", "Dados faltando");
+    return;
+  }
+  String filename = server.arg("file");
+  if (!filename.endsWith(".json")) filename += ".json";
+  String path = "/encounters/" + filename;
+
+  File f = SD.open(path, FILE_WRITE);
+  if (!f) {
+    sendCorsHeaders();
+    server.send(500, "text/plain", "Falha ao gravar arquivo no SD");
+    return;
+  }
+  f.print(server.arg("plain"));
+  f.close();
+  Serial.println("[SD] Encontro salvo com sucesso: " + path);
+  sendCorsHeaders();
+  server.send(200, "text/plain", "Encontro salvo no SD com sucesso!");
 }
 
 // --- Leitura do Touch XPT2046 e Botão BOOT ---
@@ -736,9 +1104,26 @@ void setup() {
   tft.setRotation(0);
   tft.fillScreen(TFT_BLACK);
 
+  // Inicializa Touch via HSPI
   touchSpi.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
   ts.begin(touchSpi);
   ts.setRotation(0);
+
+  // Inicializa Cartão MicroSD via VSPI
+  sdSPI.begin(SD_SCK, SD_MISO, SD_MOSI, SD_CS);
+  if (SD.begin(SD_CS, sdSPI, 20000000)) {
+    sdAvailable = true;
+    Serial.println("[SD] Cartao MicroSD detectado e pronto!");
+    if (!SD.exists("/encounters")) {
+      SD.mkdir("/encounters");
+    }
+    if (!SD.exists("/images")) {
+      SD.mkdir("/images");
+    }
+  } else {
+    sdAvailable = false;
+    Serial.println("[SD] Cartao MicroSD nao detectado (operando normalmente via Flash).");
+  }
 
   loadCombatantsFromNVS();
 
@@ -793,6 +1178,19 @@ void setup() {
   server.on("/clear", handleClear);
   server.on("/status", handleStatus);
   server.on("/set_wifi", handleSetWifi);
+
+  // Rotas do Cartão SD (Encontros e Imagens)
+  server.on("/list_encounters", handleListEncounters);
+  server.on("/get_encounter", handleGetEncounter);
+  server.on("/save_encounter", HTTP_POST, handleSaveEncounter);
+  server.on("/list_images", handleListImages);
+
+  // Rota de Upload de Imagem para o MicroSD
+  server.on("/upload_image", HTTP_POST, []() {
+    sendCorsHeaders();
+    server.send(200, "text/plain", "Imagem enviada e salva no cartao SD com sucesso!");
+  }, handleFileUpload);
+
   server.onNotFound(handleNotFound);
 
   server.begin();
